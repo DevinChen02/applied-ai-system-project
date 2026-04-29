@@ -8,6 +8,12 @@
 
 **PawPal+** is a Python + Streamlit app that plans a pet owner's day around their available time and the priority of each pet care task. It matters because pet care is easy to deprioritize when life gets busy — PawPal+ produces a transparent schedule (with reasoning for what was included and skipped) so owners can trust the plan and adjust it instead of guessing.
 
+## Walkthrough Video
+
+A short end-to-end walkthrough of PawPal+ running (owner setup → task entry → reliable plan generation → reliability score, signals, and guardrail actions):
+
+[Watch the Loom walkthrough](https://www.loom.com/share/8ffe8bca13da4f1087fa4ba0c24c19ba)
+
 ## System Diagram
 
 ```mermaid
