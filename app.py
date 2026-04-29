@@ -141,19 +141,59 @@ st.divider()
 st.subheader("Build Schedule")
 st.caption("Generate a schedule from your current tasks and available time.")
 
+strict_mode = st.toggle(
+    "Strict reliability mode",
+    value=False,
+    help=(
+        "When on, raises the minimum reliability score to 0.8 so the planner "
+        "more aggressively reorders or drops low-priority tasks."
+    ),
+)
+
 if st.button("Generate schedule"):
+    if strict_mode:
+        st.session_state.owner.reliability_min_score = 0.8
+    else:
+        st.session_state.owner.reliability_min_score = 0.6
+
     scheduler = Scheduler(pet=st.session_state.pet)
     incomplete_tasks = scheduler.filter_tasks(completed=False)
     sorted_by_priority = scheduler.sort_by_priority()
     sorted_by_time = scheduler.sort_by_time()
-    conflicts = scheduler.detect_time_conflicts()
-    explained_plan = scheduler.explain_plan()
-    plan = explained_plan["plan"]
+    reliable_result = scheduler.build_reliable_plan()
+    plan = reliable_result["plan"]
+    conflicts = reliable_result["conflicts"]
+    reliability = reliable_result["reliability"]
 
     st.success("Schedule generated.")
     st.write(f"Time budget: {plan['time_budget']} minutes")
     st.write(f"Total time used: {plan['total_time_used']} minutes")
     st.write(f"Remaining minutes: {plan['remaining_minutes']}")
+
+    st.markdown("### Reliability report")
+    status = reliability["status"]
+    score = reliability["score"]
+    if status == "high":
+        st.success(f"Reliability: HIGH (score {score:.2f})")
+    elif status == "medium":
+        st.info(f"Reliability: MEDIUM (score {score:.2f})")
+    else:
+        st.warning(
+            f"Reliability: LOW (score {score:.2f}) — review the signals and "
+            "actions below before trusting this plan."
+        )
+
+    if reliability["signals"]:
+        st.markdown("**Signals affecting confidence:**")
+        for signal in reliability["signals"]:
+            st.write(f"- {signal}")
+
+    if reliability["actions"]:
+        st.markdown("**Guardrail actions taken:**")
+        for action in reliability["actions"]:
+            st.write(f"- {action}")
+    else:
+        st.caption("No guardrail adjustments were needed.")
 
     st.markdown("### Scheduler insights")
     if incomplete_tasks:
@@ -209,5 +249,5 @@ if st.button("Generate schedule"):
         st.table(skipped_rows)
 
     st.markdown("### Why this plan")
-    for reason in explained_plan["reasoning"]:
+    for reason in reliable_result["reasoning"]:
         st.write(f"- {reason}")

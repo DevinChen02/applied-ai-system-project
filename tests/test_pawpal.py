@@ -1,6 +1,15 @@
 from datetime import date, timedelta
+import json
 
-from pawpal_system import Owner, Pet, Scheduler, Task
+import pawpal_system
+from pawpal_system import (
+	Owner,
+	Pet,
+	ReliabilityReport,
+	ReliabilityScorer,
+	Scheduler,
+	Task,
+)
 
 
 def test_task_mark_complete_changes_status() -> None:
@@ -351,3 +360,163 @@ def test_conflict_detection_flags_duplicate_times() -> None:
 	assert "time conflict at 08:00" in conflicts[0]
 	assert "Buddy: Walk" in conflicts[0]
 	assert "Buddy: Feed" in conflicts[0]
+
+
+# ----------------------------------------------------------------------
+# Reliability extension tests
+# ----------------------------------------------------------------------
+
+
+def _build_owner_with_two_pets(available_minutes: int = 120) -> tuple[Owner, Pet, Pet]:
+	owner = Owner(name="Alex", available_minutes=available_minutes)
+	pet1 = Pet(name="Buddy", species="Dog", age=3, owner=owner)
+	pet2 = Pet(name="Mochi", species="Cat", age=2, owner=owner)
+	return owner, pet1, pet2
+
+
+def test_reliability_score_penalizes_conflicts() -> None:
+	owner, pet1, pet2 = _build_owner_with_two_pets()
+	pet1.add_task(
+		Task(title="Walk", duration_minutes=20, priority="high", category="exercise", time_of_day="08:00")
+	)
+	pet2.add_task(
+		Task(title="Feed", duration_minutes=10, priority="high", category="feeding", time_of_day="08:00")
+	)
+
+	scheduler = Scheduler(pet=pet1)
+	plan = scheduler.build_plan()
+	conflicts = scheduler.detect_time_conflicts()
+	tasks = scheduler.filter_tasks(completed=False)
+
+	scorer = ReliabilityScorer()
+	report = scorer.evaluate(plan, conflicts, tasks)
+
+	assert report.score < 1.0
+	assert any("time conflict" in signal for signal in report.signals)
+
+
+def test_reliability_score_penalizes_skipped_high_priority() -> None:
+	owner = Owner(name="Alex", available_minutes=10)
+	pet = Pet(name="Buddy", species="Dog", age=3, owner=owner)
+	pet.add_task(
+		Task(title="Big Walk", duration_minutes=10, priority="high", category="exercise", time_of_day="08:00")
+	)
+	pet.add_task(
+		Task(title="Vet Trip", duration_minutes=10, priority="high", category="health", time_of_day="09:00")
+	)
+
+	scheduler = Scheduler(pet=pet)
+	plan = scheduler.build_plan()
+	tasks = scheduler.filter_tasks(completed=False)
+
+	scorer = ReliabilityScorer()
+	report = scorer.evaluate(plan, conflicts=[], tasks=tasks)
+
+	# One high-priority task got skipped because the budget only fits one.
+	assert any("high-priority" in signal for signal in report.signals)
+	assert report.score < 1.0
+
+
+def test_reliability_status_mapping() -> None:
+	scorer = ReliabilityScorer()
+	assert scorer.status_from_score(0.95) == "high"
+	assert scorer.status_from_score(0.80) == "high"
+	assert scorer.status_from_score(0.79) == "medium"
+	assert scorer.status_from_score(0.60) == "medium"
+	assert scorer.status_from_score(0.59) == "low"
+	assert scorer.status_from_score(0.0) == "low"
+
+
+def test_guardrails_drop_low_priority_when_score_is_low(tmp_path, monkeypatch) -> None:
+	monkeypatch.setattr(pawpal_system, "RELIABILITY_LOG_PATH", tmp_path / "runs.jsonl")
+
+	# Tight budget + conflict + a low-priority task that can be dropped.
+	owner = Owner(name="Alex", available_minutes=35, reliability_min_score=0.9)
+	pet1 = Pet(name="Buddy", species="Dog", age=3, owner=owner)
+	pet2 = Pet(name="Mochi", species="Cat", age=2, owner=owner)
+
+	pet1.add_task(
+		Task(title="Walk", duration_minutes=20, priority="high", category="exercise", time_of_day="08:00")
+	)
+	pet2.add_task(
+		Task(title="Feed", duration_minutes=10, priority="high", category="feeding", time_of_day="08:00")
+	)
+	pet1.add_task(
+		Task(title="Brush", duration_minutes=5, priority="low", category="grooming", time_of_day="10:00")
+	)
+
+	scheduler = Scheduler(pet=pet1)
+	result = scheduler.build_reliable_plan()
+
+	scheduled_titles = [task["title"] for task in result["plan"]["scheduled_tasks"]]
+	skipped_titles = [item["task"]["title"] for item in result["plan"]["skipped_tasks"]]
+
+	# The low-priority "Brush" task should be dropped by the guardrail.
+	assert "Brush" not in scheduled_titles
+	assert "Brush" in skipped_titles
+	assert any("Dropped low-priority" in action for action in result["reliability"]["actions"])
+
+
+def test_reliable_plan_reorders_when_conflicts_exist(tmp_path, monkeypatch) -> None:
+	monkeypatch.setattr(pawpal_system, "RELIABILITY_LOG_PATH", tmp_path / "runs.jsonl")
+
+	owner = Owner(name="Alex", available_minutes=120, reliability_min_score=0.9)
+	pet1 = Pet(name="Buddy", species="Dog", age=3, owner=owner)
+	pet2 = Pet(name="Mochi", species="Cat", age=2, owner=owner)
+	pet1.add_task(
+		Task(title="Late", duration_minutes=10, priority="high", category="general", time_of_day="20:00")
+	)
+	pet1.add_task(
+		Task(title="Morning Walk", duration_minutes=20, priority="high", category="exercise", time_of_day="08:00")
+	)
+	pet2.add_task(
+		Task(title="Feed", duration_minutes=10, priority="high", category="feeding", time_of_day="08:00")
+	)
+
+	scheduler = Scheduler(pet=pet1)
+	result = scheduler.build_reliable_plan()
+
+	assert any(
+		"Reordered scheduled tasks by time-of-day" in action
+		for action in result["reliability"]["actions"]
+	)
+	scheduled_times = [task["time_of_day"] for task in result["plan"]["scheduled_tasks"]]
+	assert scheduled_times == sorted(scheduled_times)
+
+
+def test_reliability_log_written(tmp_path, monkeypatch) -> None:
+	log_path = tmp_path / "runs.jsonl"
+	monkeypatch.setattr(pawpal_system, "RELIABILITY_LOG_PATH", log_path)
+
+	owner = Owner(name="Alex", available_minutes=60)
+	pet = Pet(name="Buddy", species="Dog", age=3, owner=owner)
+	pet.add_task(
+		Task(title="Walk", duration_minutes=20, priority="high", category="exercise", time_of_day="08:00")
+	)
+
+	scheduler = Scheduler(pet=pet)
+	scheduler.build_reliable_plan()
+
+	assert log_path.exists()
+	lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+	assert len(lines) == 1
+	entry = json.loads(lines[0])
+	assert entry["owner"] == "Alex"
+	assert entry["pet"] == "Buddy"
+	assert "reliability" in entry
+	assert "score" in entry["reliability"]
+
+
+def test_reliability_report_to_dict_round_trips() -> None:
+	report = ReliabilityReport(
+		score=0.75,
+		status="medium",
+		signals=["a", "b"],
+		actions=["did x"],
+	)
+	payload = report.to_dict()
+	assert payload["score"] == 0.75
+	assert payload["status"] == "medium"
+	assert payload["signals"] == ["a", "b"]
+	assert payload["actions"] == ["did x"]
+	assert "generated_at" in payload
