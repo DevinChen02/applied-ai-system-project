@@ -14,7 +14,9 @@ A short end-to-end walkthrough of PawPal+ running (owner setup → task entry �
 
 [Watch the Loom walkthrough](https://www.loom.com/share/8ffe8bca13da4f1087fa4ba0c24c19ba)
 
-## System Diagram
+## System Architecture Diagram
+
+The diagram below is the canonical System Architecture Diagram for PawPal+ (rendered inline via Mermaid). For a structured reflection on intended use, limitations, risks, and mitigations, see [model_card.md](model_card.md).
 
 ```mermaid
 flowchart TD
@@ -220,21 +222,3 @@ Building PawPal+ — and especially adding the reliability layer on top of it �
 
 It also reframed how I work with AI as a tool. The judgement calls — warnings vs. exceptions, deterministic scorer vs. LLM judge, what the guardrail is allowed to change — were mine, but AI was a strong drafting partner once I brought concrete constraints (signal weights, threshold mapping) and a test suite. The biggest takeaway: *define the system boundaries cleanly and write the tests first*, and both humans and models can reason about (and trust) what the system is doing.
 
-### Limitations and biases in the system
-
-PawPal+ has real limitations baked into its design choices. The scheduler is **greedy and priority-first**, which means a single high-priority task can crowd out several useful low-priority ones — owners who under-rate enrichment or grooming as "low" will see those tasks repeatedly skipped, reinforcing their own labeling bias. The reliability scorer uses **fixed, hand-picked weights** (−0.15 per conflict, −0.10 per skipped high-priority task, etc.); those numbers reflect *my* intuition about what makes a plan trustworthy, not an empirical study, so the score is opinionated rather than objective. The system also assumes the owner accurately knows their `available_minutes` and each task's `duration_minutes` — garbage in, confidently-scored garbage out. Finally, the model is **species-agnostic in its logic** but the example data and defaults skew toward common pets (dogs, cats); owners of reptiles, birds, or exotics may find the priority/category vocabulary doesn't fit their care routines.
-
-### Potential misuse and prevention
-
-The most realistic misuse is **over-trusting the plan** — an owner could treat the schedule as medical advice ("the AI didn't include the medication, so I'll skip it today") instead of as a planning aid. To mitigate this, every plan ships with an explicit reasoning trace (`explain_plan()`), the reliability score and signals are surfaced in the UI, and guardrail actions ("Dropped low-priority task X") are logged so the human can always see *what* was changed and *why*. A second risk is **logging sensitive data**: `logs/pawpal_runs.jsonl` includes owner and pet names; if shared, that's a small privacy leak. Prevention is to keep `logs/` local (it's already untracked), document the logging behavior in the README, and avoid putting medical or financial detail into task titles. Finally, the deterministic scorer can't be jailbroken with prompt injection (no LLM in the loop), which is a deliberate safety win over a hypothetical "LLM judge" design.
-
-### What surprised me while testing reliability
-
-The biggest surprise was how often the **guardrail did nothing because the score landed exactly on the threshold**. My first reliability tests passed for the wrong reason — the score was `0.6`, the threshold was `0.6`, so `score < min_score` was false and no guardrail ran. That taught me to design test inputs that land *clearly* on one side of a threshold, and it made me add a strict-mode toggle (0.8) so the guardrail behavior is observable in the UI. I was also surprised that the simplest signal — "remaining budget < 10 minutes" — caught more low-confidence runs than the conflict signal did; tight budgets, not collisions, were the dominant failure mode in my sample scenarios. And monkeypatching `RELIABILITY_LOG_PATH` turned out to be far cleaner than threading a path through every method, which I wouldn't have predicted from the UML.
-
-### Collaboration with AI during this project
-
-I used AI (GitHub Copilot Chat) as a drafting and debugging partner throughout — for class boundary brainstorming, writing the first cut of `ReliabilityScorer`, and shaping pytest fixtures around `tmp_path` + `monkeypatch`.
-
-- **One genuinely helpful suggestion:** when I described the reliability layer in plain English, the AI suggested making `RELIABILITY_LOG_PATH` a **module-level constant** that tests could `monkeypatch`, instead of injecting a log path through `Scheduler.__init__` and every downstream call. That suggestion collapsed a tangle of constructor arguments into one line of test setup (`monkeypatch.setattr(pawpal_system, "RELIABILITY_LOG_PATH", tmp_path / "runs.jsonl")`) and is the reason the reliability tests are short and readable.
-- **One flawed suggestion I rejected:** for time-conflict handling, the AI initially proposed **raising an exception** when two tasks shared a `time_of_day`. I rejected that because a daily planner that crashes on a calendar collision is worse than one that warns — the human is the final arbiter of whether 8:00 walk vs. 8:00 feed is actually a problem. I kept conflicts as warning *strings* surfaced through `detect_time_conflicts()` and as a *signal* in the reliability report, which preserves the information without breaking the flow. The lesson: AI defaults to "fail loudly," but UX-facing systems often need "warn visibly and keep going."
